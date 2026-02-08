@@ -383,6 +383,181 @@ This file (FORKUUSHO.md) and `implementation_log.md` are insurance policies. Whe
 - **Blockscout**: Block explorer (for verification)
 - **Safe Multisig**: Decentralized ownership
 
+## Phase 2: Backend Services - The Verification Engine
+
+After shipping the smart contracts, we needed a way to actually **verify** that users are maintaining their streaks. Remember: the contracts don't watch the chain themselves (too expensive). They trust our backend service to call `verifyStreak()`.
+
+### The Core Problem
+
+How do you prove someone made a transaction today without checking every single transaction on the chain?
+
+**Answer**: Use Blockscout's API as a "search engine" for transactions.
+
+### The Verification Service (`streakVerifier.ts`)
+
+This 350-line file is the brain of the operation. Here's the flow:
+
+1. **Get the user's active challenge** from database
+2. **Query Blockscout API**: "Show me all transactions from this address in the last 24 hours"
+3. **Filter for verified contracts**: Did they interact with any whitelisted contracts?
+4. **Update database**: Mark today as verified (or not)
+5. **Optionally call contract**: `verifyStreak(challengeId)` to update on-chain state
+
+The elegant part: We **don't need to call the contract every day**. We only call it when:
+- User wants to claim their reward (needs on-chain proof)
+- User has gone 24h+ without verification (mark as failed)
+
+This saves massive gas costs. Daily updates in database are free; on-chain calls cost ~$0.50 each.
+
+### Batch Verification: The Cron Job
+
+Every 6 hours, we run `batchVerifyActiveChallenges()`:
+
+```typescript
+// Pseudo-code
+for each active challenge:
+  if (more than 20 hours since last verification):
+    check for verified transactions
+    update database
+    if (no transactions found AND deadline passed):
+      mark challenge as failed
+```
+
+Why 20 hours instead of 24? **Grace period**. If someone transacts at 11pm one day and 1am the next, that's technically 26 hours but we shouldn't fail them.
+
+### The API Routes: CRUD for Everything
+
+We built 4 API routes in Next.js:
+
+**1. POST /api/verify-streak**
+Manual trigger for verification. Frontend calls this when user clicks "Verify Now". Also has a batch mode (`?batch=true`) for the cron job.
+
+**2. GET/POST/DELETE /api/user/[address]**
+User profile management:
+- GET: Fetch user + stats
+- POST: Create/update username
+- DELETE: Remove user (keeps address for foreign keys)
+
+Username validation here is critical:
+```typescript
+if (!/^[a-zA-Z0-9_]+$/.test(username)) {
+  return error('Only letters, numbers, underscores');
+}
+```
+
+Prevents SQL injection and XSS attacks via usernames.
+
+**3. GET/POST /api/challenges**
+Query challenges with filters (`?status=active&user=0x123`) and create new challenges (called after on-chain transaction confirms).
+
+**4. GET /api/platform-stats**
+Powers the landing page. Fetches:
+- Vault balance (from contract via viem)
+- Active challenges (from database)
+- Success rate calculations
+- Recent activity feed
+
+This is the "dashboard in an endpoint." Single request, everything you need to show platform health.
+
+### Why This Architecture?
+
+You might ask: "Why not just watch the chain in real-time with WebSockets?"
+
+**We considered it**. Here's the trade-off:
+
+| Approach | Pros | Cons |
+|----------|------|------|
+| **WebSocket** | Real-time (instant verification) | Complex (reconnection logic, memory leaks), expensive (persistent connection) |
+| **Cron Job (6h)** | Simple, cheap, good enough | Up to 6-hour delay |
+
+For MVP, **simple wins**. Users check their dashboard once a day anyway. A 6-hour delay doesn't matter. Post-launch, we can upgrade to WebSockets if needed.
+
+### The Frontend: From Zero to Hero Page
+
+Once backend was solid, frontend came together fast.
+
+#### Providers Setup
+
+Modern Web3 apps need a **provider stack**:
+
+```typescript
+<WagmiProvider>        // Ethereum state management
+  <QueryClientProvider>  // Data fetching + caching
+    <RainbowKitProvider>   // Wallet connection UI
+      {children}
+    </RainbowKitProvider>
+  </QueryClientProvider>
+</WagmiProvider>
+```
+
+This gives us:
+- Automatic wallet detection (MetaMask, WalletConnect, Coinbase, etc.)
+- Network switching
+- Transaction status tracking
+- Request caching (don't re-fetch if data is fresh)
+
+#### Landing Page: First Impressions Matter
+
+The landing page is a **sales page**, not a dashboard. Goals:
+1. **Explain the concept** in 5 seconds
+2. **Show proof** (real stats from the platform)
+3. **Two clear CTAs**: Start Challenge or Become LP
+
+Key components:
+- **Hero**: "Earn Yield or Win Bonuses on MegaETH Streaks" (crystal clear value prop)
+- **Stats Cards**: Live data from `/api/platform-stats` (social proof)
+- **How It Works**: 3-step explanation with emoji icons (visual > text)
+- **Recent Activity**: Shows last 5 challenges (proof of activity)
+
+Design decision: **Gradient backgrounds** instead of flat colors. Why? It looks more "modern DeFi" and less "boring enterprise dashboard."
+
+```css
+.bg-gradient-primary {
+  background: linear-gradient(135deg, #0ea5e9 0%, #0284c7 100%);
+}
+```
+
+#### Tailwind CSS: The Secret Weapon
+
+Every style is a utility class:
+```tsx
+<div className="card p-6 text-center card-hover">
+```
+
+This means:
+- No separate CSS files to manage
+- Can't accidentally break other components (no global styles)
+- Prototyping is **insanely fast** (no switching between files)
+
+We defined custom utilities in `globals.css`:
+- `.card`: Pre-styled card component
+- `.btn-primary`: Gradient button
+- `.spinner`: Loading animation
+
+### What We're Building Next
+
+Three critical pages remain:
+
+1. **Create Challenge** (`/bet-it/create`):
+   - Duration selector (7, 14, 30, 60, 90 days)
+   - Stake input (0.01-100 ETH)
+   - Bonus calculator: "Stake 1 ETH for 30 days → Win 1.225 ETH"
+   - Preview with heatmap showing current streak
+
+2. **Dashboard** (`/bet-it/dashboard`):
+   - Active challenge progress: "Day 15/30 (50%)"
+   - Time until next required transaction
+   - Claim button (if eligible)
+   - Forfeit button (emergency exit)
+
+3. **LP Vault** (`/bet-it/lp-vault`):
+   - Current position (shares, value, profit)
+   - Weekly yield percentage
+   - Deposit/withdraw forms
+   - Vault stats (total assets, active challenges)
+
+The architecture is solid. Backend works. Landing page looks sharp. Now it's just execution—build the pages, ship them, iterate.
+
 ## Final Thoughts
 
 Building a 3-day MVP is like speedrunning a video game: you skip cutscenes, take shortcuts, and pray nothing breaks. But that's the point—**done is better than perfect**.
